@@ -111,56 +111,74 @@ do
         OFFSET_SUFFIX="-$ID"
     fi
 
-    echo "DELETE index $INDEX"
+    SECONDS=0
+    echo -ne "DELETE index $INDEX"
     curl -s --request DELETE --url http://$USER:$PASSWORD@$FULL_URL/$INDEX > /dev/null
-    
-    BULK_STRING="{
+    echo -e "\rDELETE index $INDEX: Took $SECONDS s"
+
+
+    SECONDS=0
+    echo "CREATE index and mapping for $INDEX"
+    # use printf here to speedup string concatenation
+    BULK_STRING=$(
+        INTRO="{
         \"settings\":{
             \"index.mapping.total_fields.limit\": ${FIELDS_LIMIT}
         },
         \"mappings\": {
-            \"properties\": {";
-    FIELD_MAPPING='';
+            \"properties\": {"
+        printf %s "$INTRO"
 
-    if toBoolean $WITH_TIMESTAMP;
-    then
-        FIELD_MAPPING+="
-            \"@timestamp\": {
-                \"type\": \"date\",
-                \"format\": \"strict_date_optional_time\"
-            },";
-    fi
+        FIELD_MAPPING=$(
+            INTRO='';
+            if toBoolean $WITH_TIMESTAMP;
+            then
+                INTRO="
+                    \"@timestamp\": {
+                        \"type\": \"date\",
+                        \"format\": \"strict_date_optional_time\"
+                    },";
+            fi
 
-    for i in $(seq 1 $FIELDS);
-    do
-        FIELD_MAPPING+="
-        \"${FIELD_PREFIX}-${i}${OFFSET_SUFFIX}\": {
-        ";
-        VALUE="\"double\"";
-        if  [ $((i % 2)) -eq 0 ]
-        then
-            VALUE="\"keyword\"";
-        fi
-        FIELD_MAPPING+="\"type\": $VALUE";
-        if  [ $((i % 2)) -eq 1 ]
-        then
-            FIELD_MAPPING+=",\"meta\": { \"unit\": \"ms\"}";
-        fi
-        FIELD_MAPPING+="}";
-        if [ $i -lt $FIELDS ]
-        then
-            FIELD_MAPPING+=", ";
-        fi
-    done
-    BULK_STRING+=$FIELD_MAPPING;
-    BULK_STRING+="
+            printf %s "$INTRO"
+
+            for i in $(seq 1 $FIELDS);
+            do
+                F_MAPPING="
+                \"${FIELD_PREFIX}-${i}${OFFSET_SUFFIX}\": {
+                ";
+                VALUE="\"double\"";
+                if  [ $((i % 2)) -eq 0 ]
+                then
+                    VALUE="\"keyword\"";
+                fi
+                F_MAPPING+="\"type\": $VALUE";
+
+                if  [ $((i % 2)) -eq 1 ]
+                then
+                    F_MAPPING+=",\"meta\": { \"unit\": \"ms\"}";
+                fi
+                F_MAPPING+="}";
+                if [ $i -lt $FIELDS ]
+                then
+                    F_MAPPING+=", ";
+                fi
+                printf %s "$F_MAPPING"
+            done
+        )
+
+
+    END_FIELD_MAPPING="
         }
     }
 }
 "
+        printf %s "$FIELD_MAPPING$END_FIELD_MAPPING"
+    )
+    echo -e "\tMapping creation: Took $SECONDS s"
     # echo -e $BULK_STRING
-    echo "CREATE index and mapping for $INDEX"
     # echo  "${BULK_STRING}"
+    SECONDS=0;
     echo "${BULK_STRING}
 " | curl -s --fail --show-error --request PUT \
             --url "http://$USER:$PASSWORD@$FULL_URL/$INDEX?pretty" \
@@ -168,6 +186,9 @@ do
             --data-binary "@-" > /dev/null
 
 
+
+    echo -e "\tcurl: Took $SECONDS s"
+    SECONDS=0;
     echo "UPDATE add documents to $INDEX"
 
     if toBoolean $WITH_TIMESTAMP;
@@ -175,42 +196,50 @@ do
         echo -e "\t > Documents are going to use UTC time";
     fi
 
-    BULK_STRING='';
-
     echo -ne "\rLoading: 0%"
-    for i in $(seq 1 $DOCS);
-    do
-      TIMESTAMP=$(date -v -${i}0S '+%FT%T.000Z');
-      DOC="
-      { \"create\":{ } }
-      { ";
-      if toBoolean $WITH_TIMESTAMP;
-      then
-        DOC+="\"@timestamp\": \"${TIMESTAMP}\", ";
-      fi
-      for j in $(seq 1 $FIELDS);
-      do
-        VALUE=1
-        if  [ $((j % 2)) -eq 0 ]
-        then
-            VALUE='"a"';
-        fi
-        DOC+="\"$FIELD_PREFIX-$j$OFFSET_SUFFIX\": ${VALUE}"
-        if [ $j -lt $FIELDS ]
-        then
-            DOC+=", ";
-        else
-            DOC+="}";
-        fi
-      done
-      BULK_STRING+=$DOC;
+    BULK_STRING=$(
+        for i in $(seq 1 $DOCS);
+        do
+            TIMESTAMP=$(date -v -${i}0S '+%FT%T.000Z');
+            DOC=$(
+                INTRO="
+            { \"create\":{ } }
+            { ";
+                printf %s "$INTRO"
+                if toBoolean $WITH_TIMESTAMP;
+                then
+                    TS_FIELD="\"@timestamp\": \"${TIMESTAMP}\", ";
+                    printf %s "$TS_FIELD"
+                fi
+                for j in $(seq 1 $FIELDS);
+                do
+                    VALUE=1
+                    if  [ $((j % 2)) -eq 0 ]
+                    then
+                        VALUE='"a"';
+                    fi
+                    FIELD_VALUE="\"$FIELD_PREFIX-$j$OFFSET_SUFFIX\": ${VALUE}"
+                    if [ $j -lt $FIELDS ]
+                    then
+                        FIELD_VALUE+=", ";
+                    else
+                        FIELD_VALUE+="}";
+                    fi
+                    printf %s "$FIELD_VALUE"
+                done
+            )
+        printf %s "$DOC";
+    
       
-      if  [ $((i % DOCS_BATCH_LIMIT)) -eq 0 ]
-      then
-        l=$(( 100 * $i / $DOCS ))
-        echo -ne "\rLoading: $l%"
-      fi
-    done
+        if  [ $((i % DOCS_BATCH_LIMIT)) -eq 0 ]
+        then
+            l=$(( 100 * $i / $DOCS ))
+            echo -ne "\rLoading: $l%"
+        fi
+        done
+    )
+    TEMP_SECONDS=$SECONDS
+    SECONDS=0;
     if [ ! -z "$BULK_STRING" ]
     then
         echo "${BULK_STRING}
@@ -221,4 +250,6 @@ do
     fi
     echo -ne "\rLoading: 100%"
     echo ""
+    echo -e "\tDocuments creation: Took $TEMP_SECONDS";
+    echo -e "\tcurl: Took $SECONDS s";
 done
